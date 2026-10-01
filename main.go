@@ -37,7 +37,7 @@ const (
 	USAGE_MARKER   = "usage"
 )
 
-type zenProxy struct {
+type ocproxy struct {
 	url   *url.URL
 	proxy *httputil.ReverseProxy
 	max   int64
@@ -96,7 +96,7 @@ type healthResponse struct {
 	Status string `json:"status"`
 }
 
-func new() (*zenProxy, error) {
+func new() (*ocproxy, error) {
 	raw := cmp.Or(os.Getenv("ZEN_URL"), ZEN_DEFAULT)
 
 	upstream, err := url.Parse(raw)
@@ -108,7 +108,7 @@ func new() (*zenProxy, error) {
 		return nil, fmt.Errorf("ZEN_URL invalida (%q): esquema ausente", raw)
 	}
 
-	z := &zenProxy{
+	z := &ocproxy{
 		url: upstream,
 		max: integer("MAX_BODY_SIZE", 1<<26),
 	}
@@ -328,7 +328,7 @@ func ttfb(state *requestState) string {
 	return state.header.Sub(state.start).Round(time.Millisecond).String()
 }
 
-func forward(z *zenProxy) http.HandlerFunc {
+func forward(z *ocproxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		state := &requestState{key: key(r), start: time.Now()}
 		r = r.WithContext(context.WithValue(r.Context(), stateKey{}, state))

@@ -1,4 +1,4 @@
-module ntdsk.com/zenproxy
+module ntdsk.com/ocproxy
 
 go 1.24.0
 

@@ -4,18 +4,18 @@ FROM golang:1.24-alpine AS build
 
 WORKDIR /src
 
-COPY zenproxy/go* ./
+COPY ocproxy/go* ./
 
 RUN go mod download
 
-COPY zenproxy/ .
+COPY ocproxy/ .
 
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/zenproxy main.go
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/ocproxy main.go
 
 FROM alpine:latest
 
-COPY --from=build /out/zenproxy /zenproxy
+COPY --from=build /out/ocproxy /ocproxy
 
 USER nobody
 
-ENTRYPOINT ["/zenproxy"]
+ENTRYPOINT ["/ocproxy"]

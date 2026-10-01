@@ -43,17 +43,17 @@ type ocproxy struct {
 	max   int64
 }
 
-type readCloser struct {
+type reader struct {
 	io.Reader
 	io.Closer
 }
 
-type promptBody struct {
+type prompt struct {
 	Model          string `json:"model"`
 	PromptCacheKey string `json:"prompt_cache_key"`
 }
 
-type requestState struct {
+type state struct {
 	key     string
 	model   string
 	session string
@@ -71,28 +71,28 @@ type usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
-type usageBody struct {
+type payload struct {
 	Usage    usage `json:"usage"`
 	Response struct {
 		Usage usage `json:"usage"`
 	} `json:"response"`
 }
 
-type usageReader struct {
+type stream struct {
 	inner io.ReadCloser
-	state *requestState
+	state *state
 	carry []byte
 }
 
-type stateKey struct{}
+type tag struct{}
 
-type errorResponse struct {
+type failure struct {
 	Code    int    `json:"code"`
 	Error   string `json:"error"`
 	Details any    `json:"details"`
 }
 
-type healthResponse struct {
+type health struct {
 	Status string `json:"status"`
 }
 
@@ -115,7 +115,7 @@ func new() (*ocproxy, error) {
 
 	z.proxy = &httputil.ReverseProxy{
 		Rewrite: func(req *httputil.ProxyRequest) {
-			stripUpgrade(req.Out.Header)
+			strip(req.Out.Header)
 			req.SetURL(upstream)
 			req.SetXForwarded()
 		},
@@ -126,11 +126,11 @@ func new() (*ocproxy, error) {
 			state.status = res.StatusCode
 
 			if res.StatusCode < ERROR_STATUS {
-				res.Body = &usageReader{inner: res.Body, state: state}
+				res.Body = &stream{inner: res.Body, state: state}
 				return nil
 			}
 
-			logUpstream(res)
+			report(res)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -141,7 +141,7 @@ func new() (*ocproxy, error) {
 	return z, nil
 }
 
-func stripUpgrade(header http.Header) {
+func strip(header http.Header) {
 	upgrade := header.Get(UPGRADE_HEADER)
 	if upgrade == "" {
 		return
@@ -163,36 +163,36 @@ func integer(name string, fallback int64) int64 {
 	}
 
 	v, err := strconv.ParseInt(raw, 10, 64)
-		if err == nil {
-			if v > 0 {
-				return v
-			}
+	if err == nil {
+		if v > 0 {
+			return v
 		}
-
-		log.Printf("WARN: %s invalida (%q), usando %d", name, raw, fallback)
-		return fallback
 	}
 
-func prompt(raw []byte) promptBody {
-	body := &promptBody{}
-	if err := json.Unmarshal(raw, body); err != nil {
-		return promptBody{}
-	}
-
-	return *body
+	log.Printf("WARN: %s invalida (%q), usando %d", name, raw, fallback)
+	return fallback
 }
 
-func stateOf(ctx context.Context) *requestState {
-	state, ok := ctx.Value(stateKey{}).(*requestState)
+func body(raw []byte) prompt {
+	p := &prompt{}
+	if err := json.Unmarshal(raw, p); err != nil {
+		return prompt{}
+	}
+
+	return *p
+}
+
+func stateOf(ctx context.Context) *state {
+	s, ok := ctx.Value(tag{}).(*state)
 	if ok {
-		return state
+		return s
 	}
 
-	return &requestState{}
+	return &state{}
 }
 
-func model(prompt promptBody) string {
-	return cmp.Or(prompt.Model, "-")
+func model(p prompt) string {
+	return cmp.Or(p.Model, "-")
 }
 
 func bearer(header string) string {
@@ -217,20 +217,20 @@ func key(r *http.Request) string {
 	return hex.EncodeToString(sum[:KEY_BYTES])
 }
 
-func usageOf(line []byte) (usage, bool) {
+func tokens(line []byte) (usage, bool) {
 	raw := bytes.TrimSpace(bytes.TrimPrefix(bytes.TrimSpace(line), []byte(DATA_MARKER)))
 
-	body := &usageBody{}
-	if err := json.Unmarshal(raw, body); err != nil {
+	p := &payload{}
+	if err := json.Unmarshal(raw, p); err != nil {
 		return usage{}, false
 	}
 
-	if body.Usage != (usage{}) {
-		return body.Usage, true
+	if p.Usage != (usage{}) {
+		return p.Usage, true
 	}
 
-	if body.Response.Usage != (usage{}) {
-		return body.Response.Usage, true
+	if p.Response.Usage != (usage{}) {
+		return p.Response.Usage, true
 	}
 
 	return usage{}, false
@@ -252,7 +252,7 @@ func out(item *usage) string {
 	return strconv.Itoa(cmp.Or(item.CompletionTokens, item.OutputTokens))
 }
 
-func (u *usageReader) Read(p []byte) (int, error) {
+func (u *stream) Read(p []byte) (int, error) {
 	n, err := u.inner.Read(p)
 	if n > 0 {
 		u.scan(p[:n])
@@ -261,11 +261,11 @@ func (u *usageReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (u *usageReader) Close() error {
+func (u *stream) Close() error {
 	return u.inner.Close()
 }
 
-func (u *usageReader) scan(chunk []byte) {
+func (u *stream) scan(chunk []byte) {
 	lines := bytes.Split(append(u.carry, chunk...), []byte(NEWLINE))
 
 	u.carry = append([]byte(nil), lines[len(lines)-1]...)
@@ -278,15 +278,15 @@ func (u *usageReader) scan(chunk []byte) {
 	}
 }
 
-func (u *usageReader) parse(line []byte) {
+func (u *stream) parse(line []byte) {
 	if bytes.Contains(line, []byte(USAGE_MARKER)) {
-		if value, ok := usageOf(line); ok {
+		if value, ok := tokens(line); ok {
 			u.state.usage = &value
 		}
 	}
 }
 
-func randomSession() (string, error) {
+func generate() (string, error) {
 	raw := make([]byte, 8)
 	if _, err := rand.Read(raw); err != nil {
 		return "", fmt.Errorf("gerar sessao: %w", err)
@@ -295,32 +295,32 @@ func randomSession() (string, error) {
 	return strconv.FormatUint(binary.BigEndian.Uint64(raw), 10), nil
 }
 
-func logUpstream(res *http.Response) {
+func report(res *http.Response) {
 	state := stateOf(res.Request.Context())
 
-	body, err := io.ReadAll(io.LimitReader(res.Body, LOG_BODY_MAX))
+	raw, err := io.ReadAll(io.LimitReader(res.Body, LOG_BODY_MAX))
 	if err != nil {
 		log.Printf("ERROR: %d upstream key=%s model=%s %s: %s", res.StatusCode, state.key, state.model, res.Request.URL.Path, err.Error())
 		return
 	}
 
-	res.Body = readCloser{
-		Reader: io.MultiReader(bytes.NewReader(body), res.Body),
+	res.Body = reader{
+		Reader: io.MultiReader(bytes.NewReader(raw), res.Body),
 		Closer: res.Body,
 	}
 
-	log.Printf("ERROR: %d upstream key=%s model=%s %s %s: %s", res.StatusCode, state.key, state.model, res.Request.Method, res.Request.URL.Path, oneLine(body))
+	log.Printf("ERROR: %d upstream key=%s model=%s %s %s: %s", res.StatusCode, state.key, state.model, res.Request.Method, res.Request.URL.Path, collapse(raw))
 }
 
-func oneLine(body []byte) string {
-	return strings.Join(strings.Fields(string(body)), " ")
+func collapse(raw []byte) string {
+	return strings.Join(strings.Fields(string(raw)), " ")
 }
 
-func logRequest(state *requestState) {
+func emit(state *state) {
 	log.Printf("SESSION %s key=%s model=%s status=%d in=%s out=%s ttfb=%s total=%s", state.session, state.key, state.model, state.status, in(state.usage), out(state.usage), ttfb(state), time.Since(state.start).Round(time.Millisecond))
 }
 
-func ttfb(state *requestState) string {
+func ttfb(state *state) string {
 	if state.header.IsZero() {
 		return "-"
 	}
@@ -330,9 +330,9 @@ func ttfb(state *requestState) string {
 
 func forward(z *ocproxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		state := &requestState{key: key(r), start: time.Now()}
-		r = r.WithContext(context.WithValue(r.Context(), stateKey{}, state))
-		defer logRequest(state)
+		state := &state{key: key(r), start: time.Now()}
+		r = r.WithContext(context.WithValue(r.Context(), tag{}, state))
+		defer emit(state)
 
 		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, z.max))
 		if err != nil {
@@ -343,12 +343,12 @@ func forward(z *ocproxy) http.HandlerFunc {
 		r.Body = io.NopCloser(bytes.NewReader(raw))
 		r.ContentLength = int64(len(raw))
 
-		body := prompt(raw)
-		state.model = model(body)
+		p := body(raw)
+		state.model = model(p)
 
-		session := body.PromptCacheKey
+		session := p.PromptCacheKey
 		if session == "" {
-			session, err = randomSession()
+			session, err = generate()
 			if err != nil {
 				fail(w, r, 500, "Erro interno", err.Error())
 				return
@@ -364,7 +364,7 @@ func forward(z *ocproxy) http.HandlerFunc {
 
 func healthz() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, healthResponse{Status: "ok"})
+		write(w, http.StatusOK, health{Status: "ok"})
 	}
 }
 
@@ -373,19 +373,20 @@ func fail(w http.ResponseWriter, r *http.Request, code int, message string, deta
 	state.status = code
 
 	log.Printf("ERROR: %d key=%s model=%s %s %s: %s (%v)", code, state.key, state.model, r.Method, r.URL.Path, message, details)
-	writeJSON(w, code, errorResponse{Code: code, Error: message, Details: details})
+	write(w, code, failure{Code: code, Error: message, Details: details})
 }
 
-func writeJSON(w http.ResponseWriter, status int, body any) {
+func write(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	enc := json.NewEncoder(w)
-		enc.SetEscapeHTML(false)
 
-		if err := enc.Encode(body); err != nil {
-			log.Printf("ERROR: resposta %d: %s", status, err.Error())
-		}
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+
+	if err := enc.Encode(body); err != nil {
+		log.Printf("ERROR: resposta %d: %s", status, err.Error())
 	}
+}
 
 func main() {
 	z, err := new()

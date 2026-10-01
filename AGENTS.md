@@ -8,12 +8,11 @@ Do not refactor, redesign, optimize, rename, or "improve" existing code unless e
 ## 1. Naming
 
 - Use short, clear, direct names.
+- Prefer a single word.
 - Use `camelCase` for unexported identifiers and `PascalCase` for exported ones.
 - Keep names lowercase except for the first letter and initialisms.
 - Capitalize initialisms in full: `ID`, `URL`, `URI`, `HTTP`, `HTTPS`, `API`, `JSON`, `SQL`, `SSE`, `TLS`, `TTFB`, `CPU`, `IO`, `OS`.
-- Prefer simple, single-purpose names.
-- Drop a redundant suffix when a simple name is already available (ex.: `prompt`, not `prompt_of`).
-- Keep the suffix only when the simple name collides with an existing type, field, or local variable (ex.: `stateOf`, `usageOf`).
+- Use a compound name only when a single word collides with an existing type, field, import, or local variable (ex.: `stateOf`, `write`, `strip`).
 
 Examples:
 
@@ -27,13 +26,14 @@ urls := []string{}
 And:
 
 ```go
-type requestState struct {
+type state struct {
 	key     string
 	started time.Time
 }
 
-func writeJSON(w http.ResponseWriter, status int, body any) {}
-func stripUpgrade(header http.Header) {}
+func write(w http.ResponseWriter, status int, body any) {}
+func strip(header http.Header) {}
+func emit(s *state) {}
 ```
 
 Use:
@@ -48,6 +48,7 @@ Do not use:
 ```go
 func write_json(w http.ResponseWriter) {}
 func strip_upgrade(header http.Header) {}
+func log_request(state *state) {}
 ```
 
 And:
@@ -456,8 +457,8 @@ Always:
 - Use existing repository patterns.
 - Use `:=`.
 - Use `camelCase` for unexported names and `PascalCase` for exported ones.
-- Capitalize initialisms in full (ex.: `userID`, `baseURL`, `writeJSON`).
-- Keep function names short and simple, without a redundant suffix.
+- Capitalize initialisms in full (ex.: `userID`, `baseURL`).
+- Prefer a single word; use a compound name only on collision.
 - Use `snake_case` for file names.
 - Use `UPPERCASE_SNAKE_CASE` for constants.
 - Use `{}` with every `if`.
@@ -486,6 +487,7 @@ Never:
 - Use `||`.
 - Use string concatenation with `+`.
 - Use `? :` or any immediately-invoked function literal as a ternary.
+- Use a compound name when a single word is available.
 - Use incomplete `for` clauses.
 - Use comments.
 - Leave errors or rejected operations unhandled.

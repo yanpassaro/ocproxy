@@ -9,10 +9,11 @@ Do not refactor, redesign, optimize, rename, or "improve" existing code unless e
 
 - Use short, clear, direct names.
 - Prefer a single word.
-- Use `camelCase` for unexported identifiers and `PascalCase` for exported ones.
-- Keep names lowercase except for the first letter and initialisms.
+- Use lowercase names.
+- Use `PascalCase` only for types.
+- Use `camelCase` only as a last resort, when no single word names it (ex.: a name imposed by an external package).
 - Capitalize initialisms in full: `ID`, `URL`, `URI`, `HTTP`, `HTTPS`, `API`, `JSON`, `SQL`, `SSE`, `TLS`, `TTFB`, `CPU`, `IO`, `OS`.
-- Use a compound name only when a single word collides with an existing type, field, import, or local variable (ex.: `stateOf`, `write`, `strip`).
+- Use a compound name only when a single word collides with an existing type, field, import, or local variable (ex.: `stateOf`, `getUserURL`).
 
 Examples:
 
@@ -51,7 +52,7 @@ func strip_upgrade(header http.Header) {}
 func log_request(state *state) {}
 ```
 
-And:
+And, only when no single word names it:
 
 ```go
 func getUserUrl(userId int) string {}
@@ -456,9 +457,11 @@ Always:
 
 - Use existing repository patterns.
 - Use `:=`.
-- Use `camelCase` for unexported names and `PascalCase` for exported ones.
+- Use lowercase names.
+- Use `PascalCase` only for types.
+- Use `camelCase` only as a last resort.
 - Capitalize initialisms in full (ex.: `userID`, `baseURL`).
-- Prefer a single word; use a compound name only on collision.
+- Prefer a single word.
 - Use `snake_case` for file names.
 - Use `UPPERCASE_SNAKE_CASE` for constants.
 - Use `{}` with every `if`.
@@ -488,6 +491,7 @@ Never:
 - Use string concatenation with `+`.
 - Use `? :` or any immediately-invoked function literal as a ternary.
 - Use a compound name when a single word is available.
+- Use `camelCase` when a single word is available.
 - Use incomplete `for` clauses.
 - Use comments.
 - Leave errors or rejected operations unhandled.

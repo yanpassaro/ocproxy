@@ -16,6 +16,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -35,12 +36,19 @@ const (
 	NEWLINE        = "\n"
 	DATA_MARKER    = "data:"
 	USAGE_MARKER   = "usage"
+	PII_OFF        = "off"
+	PII_MASK       = "«%s:%s»"
+	PII_BYTES      = 6
+	PII_FIELD      = "prompt_cache_key"
 )
 
 type ocproxy struct {
 	url   *url.URL
 	proxy *httputil.ReverseProxy
 	key   string
+	salt  string
+	rules []rule
+	pii   bool
 	max   int64
 }
 
@@ -79,6 +87,18 @@ type payload struct {
 	} `json:"response"`
 }
 
+type spec struct {
+	kind  string
+	expr  string
+	check func(string) bool
+}
+
+type rule struct {
+	kind  string
+	expr  *regexp.Regexp
+	check func(string) bool
+}
+
 type stream struct {
 	inner io.ReadCloser
 	state *state
@@ -110,10 +130,19 @@ func new() (*ocproxy, error) {
 	}
 
 	z := &ocproxy{
-		url: upstream,
-		key: strings.TrimSpace(os.Getenv("OPENCODE_KEY")),
-		max: integer("MAX_BODY_SIZE", 1<<26),
+		url:  upstream,
+		key:  strings.TrimSpace(os.Getenv("OPENCODE_KEY")),
+		salt: os.Getenv("PII_SALT"),
+		pii:  strings.ToLower(strings.TrimSpace(os.Getenv("PII_MODE"))) != PII_OFF,
+		max:  integer("MAX_BODY_SIZE", 1<<26),
 	}
+
+	rules, err := patterns()
+	if err != nil {
+		return nil, err
+	}
+
+	z.rules = rules
 
 	z.proxy = &httputil.ReverseProxy{
 		Rewrite: func(req *httputil.ProxyRequest) {
@@ -233,6 +262,201 @@ func key(r *http.Request) string {
 	sum := sha256.Sum256([]byte(raw))
 
 	return hex.EncodeToString(sum[:KEY_BYTES])
+}
+
+func patterns() ([]rule, error) {
+	specs := []spec{
+		{kind: "email", expr: `[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`},
+		{kind: "cpf", expr: `\b\d{3}\.\d{3}\.\d{3}-\d{2}\b`, check: cpf},
+		{kind: "cnpj", expr: `\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b`, check: cnpj},
+		{kind: "card", expr: `\b\d{13,19}\b`, check: luhn},
+		{kind: "card", expr: `\b\d{4}(?:[ -]\d{4}){2,4}\b`, check: luhn},
+		{kind: "phone", expr: `(?:\+55[\s-]?(?:\d{2}[\s-]?)?9?\d{4}[\s-]?\d{4}|\(\d{2,3}\)[\s-]?9?\d{4}[\s-]?\d{4})`},
+	}
+
+	rules := make([]rule, 0, len(specs))
+
+	for _, item := range specs {
+		expr, err := regexp.Compile(item.expr)
+		if err != nil {
+			return nil, fmt.Errorf("pii %s: %w", item.kind, err)
+		}
+
+		rules = append(rules, rule{kind: item.kind, expr: expr, check: item.check})
+	}
+
+	return rules, nil
+}
+
+func redact(z *ocproxy, raw []byte) ([]byte, error) {
+	if !json.Valid(raw) {
+		return raw, nil
+	}
+
+	body := any(nil)
+
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+
+	if err := dec.Decode(&body); err != nil {
+		return nil, fmt.Errorf("pii: %w", err)
+	}
+
+	return encode(scrub(body, z.rules, z.salt))
+}
+
+func encode(body any) ([]byte, error) {
+	buf := &bytes.Buffer{}
+
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+
+	if err := enc.Encode(body); err != nil {
+		return nil, fmt.Errorf("pii: %w", err)
+	}
+
+	return bytes.TrimSuffix(buf.Bytes(), []byte(NEWLINE)), nil
+}
+
+func scrub(value any, rules []rule, salt string) any {
+	switch item := value.(type) {
+	case map[string]any:
+		for name, inner := range item {
+			if name == PII_FIELD {
+				continue
+			}
+
+			item[name] = scrub(inner, rules, salt)
+		}
+
+		return item
+	case []any:
+		for i, inner := range item {
+			item[i] = scrub(inner, rules, salt)
+		}
+
+		return item
+	case string:
+		return shield(item, rules, salt)
+	}
+
+	return value
+}
+
+func shield(text string, rules []rule, salt string) string {
+	for _, r := range rules {
+		text = r.expr.ReplaceAllStringFunc(text, func(match string) string {
+			if r.check != nil {
+				if !r.check(match) {
+					return match
+				}
+			}
+
+			return stamp(r.kind, match, salt)
+		})
+	}
+
+	return text
+}
+
+func stamp(kind string, value string, salt string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s", salt, value)))
+
+	return fmt.Sprintf(PII_MASK, kind, hex.EncodeToString(sum[:PII_BYTES]))
+}
+
+func digits(raw string) string {
+	out := make([]rune, 0, len(raw))
+
+	for _, c := range raw {
+		if c < '0' {
+			continue
+		}
+
+		if c > '9' {
+			continue
+		}
+
+		out = append(out, c)
+	}
+
+	return string(out)
+}
+
+func verify(raw string, weights []int) bool {
+	sum := 0
+
+	for i, w := range weights {
+		sum += int(raw[i]-'0') * w
+	}
+
+	mod := sum % 11
+	digit := 0
+
+	if mod >= 2 {
+		digit = 11 - mod
+	}
+
+	return digit == int(raw[len(weights)]-'0')
+}
+
+func cpf(value string) bool {
+	raw := digits(value)
+
+	if len(raw) != 11 {
+		return false
+	}
+
+	if !verify(raw, []int{10, 9, 8, 7, 6, 5, 4, 3, 2}) {
+		return false
+	}
+
+	return verify(raw, []int{11, 10, 9, 8, 7, 6, 5, 4, 3, 2})
+}
+
+func cnpj(value string) bool {
+	raw := digits(value)
+
+	if len(raw) != 14 {
+		return false
+	}
+
+	if !verify(raw, []int{5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2}) {
+		return false
+	}
+
+	return verify(raw, []int{6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2})
+}
+
+func luhn(value string) bool {
+	raw := digits(value)
+
+	if len(raw) < 13 {
+		return false
+	}
+
+	if len(raw) > 19 {
+		return false
+	}
+
+	sum := 0
+	double := false
+
+	for i := len(raw) - 1; i >= 0; i-- {
+		digit := int(raw[i] - '0')
+
+		if double {
+			digit *= 2
+			if digit > 9 {
+				digit -= 9
+			}
+		}
+
+		sum += digit
+		double = !double
+	}
+
+	return sum%10 == 0
 }
 
 func tokens(line []byte) (usage, bool) {
@@ -358,6 +582,14 @@ func forward(z *ocproxy) http.HandlerFunc {
 		if err != nil {
 			fail(w, r, 413, fmt.Sprintf("Corpo excede o limite de %d bytes", z.max), err.Error())
 			return
+		}
+
+		if z.pii {
+			raw, err = redact(z, raw)
+			if err != nil {
+				fail(w, r, 500, "Erro interno", err.Error())
+				return
+			}
 		}
 
 		r.Body = io.NopCloser(bytes.NewReader(raw))

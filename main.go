@@ -50,7 +50,7 @@ const (
 )
 
 const (
-	UPSTREAM_TIMEOUT = 5 * time.Minute
+	UPSTREAM_TIMEOUT = 90 * time.Second
 	DIAL_TIMEOUT     = 10 * time.Second
 	TLS_TIMEOUT      = 10 * time.Second
 	HEADER_TIMEOUT   = 30 * time.Second

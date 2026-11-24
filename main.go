@@ -18,8 +18,10 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -37,10 +39,14 @@ const (
 	NEWLINE        = "\n"
 	DATA_MARKER    = "data:"
 	USAGE_MARKER   = "usage"
-	PII_OFF        = "off"
 	PII_MASK       = "«%s:%s»"
 	PII_BYTES      = 6
 	PII_FIELD      = "prompt_cache_key"
+	STREAM_TYPE    = "text/event-stream"
+	JSON_TYPE      = "application/json"
+	DONE_MARKER    = "[DONE]"
+	CHUNK_SIZE     = 1 << 14
+	VAULT_LIMIT    = 4096
 )
 
 const (
@@ -59,7 +65,7 @@ type ocproxy struct {
 	key   string
 	salt  string
 	rules []rule
-	pii   bool
+	vault *vault
 	max   int64
 	wait  time.Duration
 }
@@ -111,6 +117,22 @@ type rule struct {
 	check func(string) bool
 }
 
+type vault struct {
+	mu    sync.Mutex
+	items map[string]string
+}
+
+type rewriter struct {
+	inner io.ReadCloser
+	vault *vault
+	args  map[int]*strings.Builder
+	carry []byte
+	out   []byte
+	in    []byte
+	err   error
+	done  bool
+}
+
 type stream struct {
 	inner io.ReadCloser
 	state *state
@@ -144,12 +166,12 @@ func new() (*ocproxy, error) {
 	}
 
 	z := &ocproxy{
-		url:  upstream,
-		key:  strings.TrimSpace(os.Getenv("OPENCODE_KEY")),
-		salt: os.Getenv("PII_SALT"),
-		pii:  strings.ToLower(strings.TrimSpace(os.Getenv("PII_MODE"))) != PII_OFF,
-		max:  integer("MAX_BODY_SIZE", 1<<26),
-		wait: seconds("UPSTREAM_TIMEOUT", UPSTREAM_TIMEOUT),
+		url:   upstream,
+		key:   strings.TrimSpace(os.Getenv("OPENCODE_KEY")),
+		salt:  os.Getenv("PII_SALT"),
+		vault: &vault{items: map[string]string{}},
+		max:   integer("MAX_BODY_SIZE", 1<<26),
+		wait:  seconds("UPSTREAM_TIMEOUT", UPSTREAM_TIMEOUT),
 	}
 
 	rules, err := patterns()
@@ -173,7 +195,7 @@ func new() (*ocproxy, error) {
 			state.status = res.StatusCode
 
 			if res.StatusCode < ERROR_STATUS {
-				res.Body = watch(res.Body, state, z.wait)
+				res.Body = watch(unwrap(res, z), state, z.wait)
 				return nil
 			}
 
@@ -338,7 +360,7 @@ func redact(z *ocproxy, raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("pii: %w", err)
 	}
 
-	return encode(scrub(body, z.rules, z.salt))
+	return encode(scrub(body, z.rules, z.salt, z.vault))
 }
 
 func encode(body any) ([]byte, error) {
@@ -354,7 +376,7 @@ func encode(body any) ([]byte, error) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte(NEWLINE)), nil
 }
 
-func scrub(value any, rules []rule, salt string) any {
+func scrub(value any, rules []rule, salt string, v *vault) any {
 	switch item := value.(type) {
 	case map[string]any:
 		for name, inner := range item {
@@ -362,24 +384,24 @@ func scrub(value any, rules []rule, salt string) any {
 				continue
 			}
 
-			item[name] = scrub(inner, rules, salt)
+			item[name] = scrub(inner, rules, salt, v)
 		}
 
 		return item
 	case []any:
 		for i, inner := range item {
-			item[i] = scrub(inner, rules, salt)
+			item[i] = scrub(inner, rules, salt, v)
 		}
 
 		return item
 	case string:
-		return shield(item, rules, salt)
+		return shield(item, rules, salt, v)
 	}
 
 	return value
 }
 
-func shield(text string, rules []rule, salt string) string {
+func shield(text string, rules []rule, salt string, v *vault) string {
 	for _, r := range rules {
 		text = r.expr.ReplaceAllStringFunc(text, func(match string) string {
 			if r.check != nil {
@@ -388,7 +410,10 @@ func shield(text string, rules []rule, salt string) string {
 				}
 			}
 
-			return stamp(r.kind, match, salt)
+			mask := stamp(r.kind, match, salt)
+			v.keep(mask, match)
+
+			return mask
 		})
 	}
 
@@ -639,17 +664,6 @@ func forward(z *ocproxy) http.HandlerFunc {
 			return
 		}
 
-		if z.pii {
-			raw, err = redact(z, raw)
-			if err != nil {
-				fail(w, r, 500, "Erro interno", err.Error())
-				return
-			}
-		}
-
-		r.Body = io.NopCloser(bytes.NewReader(raw))
-		r.ContentLength = int64(len(raw))
-
 		p := body(raw)
 		state.model = model(p)
 
@@ -663,6 +677,15 @@ func forward(z *ocproxy) http.HandlerFunc {
 		}
 
 		state.session = session
+
+		raw, err = redact(z, raw)
+		if err != nil {
+			fail(w, r, 500, "Erro interno", err.Error())
+			return
+		}
+
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		r.ContentLength = int64(len(raw))
 		r.Header.Set(SESSION_HEADER, session)
 
 		z.proxy.ServeHTTP(w, r)
@@ -722,4 +745,352 @@ func main() {
 	if err := s.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func unwrap(res *http.Response, z *ocproxy) io.ReadCloser {
+	kind := res.Header.Get("Content-Type")
+
+	if strings.Contains(kind, STREAM_TYPE) {
+		return &rewriter{inner: res.Body, vault: z.vault, args: map[int]*strings.Builder{}, in: make([]byte, CHUNK_SIZE)}
+	}
+
+	if !strings.Contains(kind, JSON_TYPE) {
+		return res.Body
+	}
+
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		return reader{Reader: bytes.NewReader(raw), Closer: res.Body}
+	}
+
+	return io.NopCloser(bytes.NewReader(restore(raw, z.vault)))
+}
+
+func restore(raw []byte, v *vault) []byte {
+	value, err := decode(raw)
+	if err != nil {
+		return raw
+	}
+
+	unmask(value, v)
+
+	out, err := encode(value)
+	if err != nil {
+		return raw
+	}
+
+	return out
+}
+
+func decode(raw []byte) (any, error) {
+	value := any(nil)
+
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+
+	if err := dec.Decode(&value); err != nil {
+		return nil, fmt.Errorf("pii: %w", err)
+	}
+
+	return value, nil
+}
+
+func unmask(value any, v *vault) {
+	switch item := value.(type) {
+	case map[string]any:
+		if list, ok := item["tool_calls"]; ok {
+			calls(list, v)
+		}
+
+		if call, ok := item["function_call"]; ok {
+			args(call, v)
+		}
+
+		for _, inner := range item {
+			unmask(inner, v)
+		}
+	case []any:
+		for _, inner := range item {
+			unmask(inner, v)
+		}
+	}
+}
+
+func calls(value any, v *vault) {
+	list, ok := value.([]any)
+	if !ok {
+		return
+	}
+
+	for _, entry := range list {
+		args(entry, v)
+	}
+}
+
+func args(value any, v *vault) {
+	item, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+
+	target := item
+
+	if fn, ok := item["function"].(map[string]any); ok {
+		target = fn
+	}
+
+	text, ok := target["arguments"].(string)
+	if !ok {
+		return
+	}
+
+	target["arguments"] = v.open(text)
+}
+
+func quote(text string) string {
+	raw, err := json.Marshal(text)
+	if err != nil {
+		return `""`
+	}
+
+	return string(raw)
+}
+
+func number(value any) int {
+	switch item := value.(type) {
+	case json.Number:
+		slot, err := item.Int64()
+		if err != nil {
+			return 0
+		}
+
+		return int(slot)
+	case float64:
+		return int(item)
+	}
+
+	return 0
+}
+
+func (v *vault) keep(mask string, value string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if len(v.items) >= VAULT_LIMIT {
+		return
+	}
+
+	v.items[mask] = value
+}
+
+func (v *vault) open(text string) string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if len(v.items) == 0 {
+		return text
+	}
+
+	pairs := make([]string, 0, len(v.items)*2)
+
+	for mask, value := range v.items {
+		pairs = append(pairs, mask, value)
+	}
+
+	return strings.NewReplacer(pairs...).Replace(text)
+}
+
+func (w *rewriter) Read(p []byte) (int, error) {
+	for len(w.out) == 0 {
+		if w.done {
+			return 0, w.err
+		}
+
+		n, err := w.inner.Read(w.in)
+		if n > 0 {
+			w.scan(w.in[:n])
+		}
+
+		if err != nil {
+			w.err = err
+			w.finish()
+		}
+	}
+
+	n := copy(p, w.out)
+	w.out = w.out[n:]
+
+	return n, nil
+}
+
+func (w *rewriter) Close() error {
+	return w.inner.Close()
+}
+
+func (w *rewriter) scan(chunk []byte) {
+	w.carry = append(w.carry, chunk...)
+
+	for {
+		i := bytes.IndexByte(w.carry, '\n')
+		if i < 0 {
+			return
+		}
+
+		line := w.carry[:i]
+		w.carry = w.carry[i+1:]
+
+		w.line(line)
+	}
+}
+
+func (w *rewriter) line(raw []byte) {
+	text := strings.TrimSpace(string(raw))
+
+	if !strings.HasPrefix(text, DATA_MARKER) {
+		w.write(string(raw))
+		return
+	}
+
+	payload := strings.TrimSpace(strings.TrimPrefix(text, DATA_MARKER))
+	if payload == DONE_MARKER {
+		w.flush()
+		w.write(string(raw))
+		return
+	}
+
+	w.patch(payload, string(raw))
+}
+
+func (w *rewriter) patch(payload string, raw string) {
+	value, err := decode([]byte(payload))
+	if err != nil {
+		w.write(raw)
+		return
+	}
+
+	body, ok := value.(map[string]any)
+	if !ok {
+		w.write(raw)
+		return
+	}
+
+	list, ok := body["choices"].([]any)
+	if !ok {
+		w.write(raw)
+		return
+	}
+
+	end := false
+
+	for _, entry := range list {
+		choice, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if _, ok := choice["finish_reason"].(string); ok {
+			end = true
+		}
+
+		delta, ok := choice["delta"].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		items, ok := delta["tool_calls"].([]any)
+		if !ok {
+			continue
+		}
+
+		w.collect(items)
+	}
+
+	if end {
+		w.flush()
+	}
+
+	out, err := encode(body)
+	if err != nil {
+		w.write(raw)
+		return
+	}
+
+	w.write(fmt.Sprintf("%s %s", DATA_MARKER, out))
+}
+
+func (w *rewriter) collect(items []any) {
+	for _, entry := range items {
+		call, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		fn, ok := call["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		text, ok := fn["arguments"].(string)
+		if !ok {
+			continue
+		}
+
+		if text == "" {
+			continue
+		}
+
+		w.keep(call["index"], text)
+		fn["arguments"] = ""
+	}
+}
+
+func (w *rewriter) keep(index any, text string) {
+	slot := number(index)
+
+	builder, ok := w.args[slot]
+	if !ok {
+		builder = &strings.Builder{}
+		w.args[slot] = builder
+	}
+
+	builder.WriteString(text)
+}
+
+func (w *rewriter) flush() {
+	if len(w.args) == 0 {
+		return
+	}
+
+	slots := make([]int, 0, len(w.args))
+
+	for slot := range w.args {
+		slots = append(slots, slot)
+	}
+
+	sort.Ints(slots)
+
+	for _, slot := range slots {
+		text := w.vault.open(w.args[slot].String())
+		chunk := fmt.Sprintf(`{"choices":[{"index":%d,"delta":{"tool_calls":[{"index":%d,"function":{"arguments":%s}}]},"finish_reason":null}]}`, slot, slot, quote(text))
+
+		w.write(fmt.Sprintf("%s %s", DATA_MARKER, chunk))
+	}
+
+	w.args = map[int]*strings.Builder{}
+}
+
+func (w *rewriter) write(line string) {
+	w.out = append(w.out, line...)
+	w.out = append(w.out, NEWLINE...)
+}
+
+func (w *rewriter) finish() {
+	if len(w.carry) != 0 {
+		w.line(w.carry)
+		w.carry = nil
+	}
+
+	w.flush()
+
+	w.done = true
 }

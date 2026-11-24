@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -42,6 +43,16 @@ const (
 	PII_FIELD      = "prompt_cache_key"
 )
 
+const (
+	UPSTREAM_TIMEOUT = 5 * time.Minute
+	DIAL_TIMEOUT     = 10 * time.Second
+	TLS_TIMEOUT      = 10 * time.Second
+	HEADER_TIMEOUT   = 30 * time.Second
+	IDLE_TIMEOUT     = 90 * time.Second
+	POOL_SIZE        = 100
+	KEEPALIVE        = 30 * time.Second
+)
+
 type ocproxy struct {
 	url   *url.URL
 	proxy *httputil.ReverseProxy
@@ -50,6 +61,7 @@ type ocproxy struct {
 	rules []rule
 	pii   bool
 	max   int64
+	wait  time.Duration
 }
 
 type reader struct {
@@ -103,6 +115,8 @@ type stream struct {
 	inner io.ReadCloser
 	state *state
 	carry []byte
+	timer *time.Timer
+	wait  time.Duration
 }
 
 type tag struct{}
@@ -135,6 +149,7 @@ func new() (*ocproxy, error) {
 		salt: os.Getenv("PII_SALT"),
 		pii:  strings.ToLower(strings.TrimSpace(os.Getenv("PII_MODE"))) != PII_OFF,
 		max:  integer("MAX_BODY_SIZE", 1<<26),
+		wait: seconds("UPSTREAM_TIMEOUT", UPSTREAM_TIMEOUT),
 	}
 
 	rules, err := patterns()
@@ -151,13 +166,14 @@ func new() (*ocproxy, error) {
 			req.SetXForwarded()
 		},
 		FlushInterval: -1,
+		Transport:     transport(z.wait),
 		ModifyResponse: func(res *http.Response) error {
 			state := stateOf(res.Request.Context())
 			state.header = time.Now()
 			state.status = res.StatusCode
 
 			if res.StatusCode < ERROR_STATUS {
-				res.Body = &stream{inner: res.Body, state: state}
+				res.Body = watch(res.Body, state, z.wait)
 				return nil
 			}
 
@@ -185,6 +201,26 @@ func strip(header http.Header) {
 	header.Del("HTTP2-Settings")
 	header.Del("Proxy-Connection")
 	header.Del("Keep-Alive")
+}
+
+func seconds(name string, fallback time.Duration) time.Duration {
+	return time.Duration(integer(name, int64(fallback/time.Second))) * time.Second
+}
+
+func transport(wait time.Duration) *http.Transport {
+	dial := &net.Dialer{Timeout: DIAL_TIMEOUT, KeepAlive: KEEPALIVE}
+
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dial.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          POOL_SIZE,
+		MaxIdleConnsPerHost:   POOL_SIZE,
+		IdleConnTimeout:       IDLE_TIMEOUT,
+		TLSHandshakeTimeout:   TLS_TIMEOUT,
+		ExpectContinueTimeout: time.Second,
+		ResponseHeaderTimeout: wait,
+	}
 }
 
 func integer(name string, fallback int64) int64 {
@@ -494,7 +530,24 @@ func out(item *usage) string {
 	return strconv.Itoa(cmp.Or(item.CompletionTokens, item.OutputTokens))
 }
 
+func watch(inner io.ReadCloser, state *state, wait time.Duration) *stream {
+	u := &stream{inner: inner, state: state, wait: wait}
+	u.timer = time.AfterFunc(wait, func() { abort(u) })
+
+	return u
+}
+
+func abort(u *stream) {
+	log.Printf("WARN: sessao %s sem dados por %s, abortando", u.state.session, u.wait)
+
+	if err := u.inner.Close(); err != nil {
+		log.Printf("ERROR: sessao %s: %s", u.state.session, err.Error())
+	}
+}
+
 func (u *stream) Read(p []byte) (int, error) {
+	u.timer.Reset(u.wait)
+
 	n, err := u.inner.Read(p)
 	if n > 0 {
 		u.scan(p[:n])
@@ -504,6 +557,8 @@ func (u *stream) Read(p []byte) (int, error) {
 }
 
 func (u *stream) Close() error {
+	u.timer.Stop()
+
 	return u.inner.Close()
 }
 
@@ -656,8 +711,15 @@ func main() {
 	r.Get("/healthz", healthz())
 	r.Handle("/*", forward(z))
 
+	s := &http.Server{
+		Addr:              fmt.Sprintf(":%s", port),
+		Handler:           r,
+		ReadHeaderTimeout: HEADER_TIMEOUT,
+		IdleTimeout:       IDLE_TIMEOUT,
+	}
+
 	log.Printf("LISTENING %s -> %s", port, z.url)
-	if err := http.ListenAndServe(fmt.Sprintf(":%s", port), r); err != nil {
+	if err := s.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

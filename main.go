@@ -306,12 +306,34 @@ func key(r *http.Request) string {
 
 func patterns() ([]rule, error) {
 	specs := []spec{
-		{kind: "email", expr: `[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`},
+		{kind: "ssh", expr: `(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`},
+		{kind: "gpg", expr: `(?s)-----BEGIN PGP PRIVATE KEY BLOCK-----.*?-----END PGP PRIVATE KEY BLOCK-----`},
+		{kind: "putty", expr: `(?s)PuTTY-User-Key-File-\d+:.*?Private-MAC:\s*[0-9a-fA-F]+`},
+		{kind: "dsn", expr: `(?i)\b(?:postgres|postgresql|mysql|mariadb|mongodb|mongodb\+srv|redis|rediss|amqp|amqps|sqlserver|mssql|clickhouse)://[^\s:@/]*:[^\s@/]*@[^\s"'<>\\)]+`},
+		{kind: "jwt", expr: `\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}`},
+		{kind: "bearer", expr: `(?i)\bbearer\s+[A-Za-z0-9._\-+/=]{16,}`},
+		{kind: "basic", expr: `(?i)\bbasic\s+[A-Za-z0-9+/=]{16,}`},
+		{kind: "openai", expr: `\bsk-(?:ant-)?[A-Za-z0-9_\-]{20,}`},
+		{kind: "stripe", expr: `\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}`},
+		{kind: "google", expr: `\bAIza[0-9A-Za-z_\-]{35}`},
+		{kind: "slack", expr: `\bxox[baprs]-[A-Za-z0-9\-]{10,}`},
+		{kind: "npm", expr: `\bnpm_[A-Za-z0-9]{36}`},
+		{kind: "sendgrid", expr: `\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}`},
+		{kind: "huggingface", expr: `\bhf_[A-Za-z0-9]{30,}`},
+		{kind: "sentry", expr: `https://[0-9a-f]{16,}@[A-Za-z0-9.\-]*ingest\.sentry\.io/\d+`},
+		{kind: "aws", expr: `(?i)aws_?(?:secret_?access_?key|access_?key_?id|session_?token)\s*[=:]\s*["']?[A-Za-z0-9/+=]{16,}`},
+		{kind: "aws", expr: `\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[A-Z0-9]{16}\b`},
+		{kind: "github", expr: `\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})`},
+		{kind: "gitlab", expr: `\bgl(?:pat|rt|dt|cbt|ptt|soat|imt|ffct|oas|agent)-[A-Za-z0-9_.\-]{20,}`},
 		{kind: "cpf", expr: `\b\d{3}\.\d{3}\.\d{3}-\d{2}\b`, check: cpf},
+		{kind: "cpf", expr: `\b\d{11}\b`, check: cpf},
 		{kind: "cnpj", expr: `\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b`, check: cnpj},
+		{kind: "cnpj", expr: `\b\d{14}\b`, check: cnpj},
+		{kind: "email", expr: `[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`},
 		{kind: "card", expr: `\b\d{13,19}\b`, check: luhn},
 		{kind: "card", expr: `\b\d{4}(?:[ -]\d{4}){2,4}\b`, check: luhn},
 		{kind: "phone", expr: `(?:\+55[\s-]?(?:\d{2}[\s-]?)?9?\d{4}[\s-]?\d{4}|\(\d{2,3}\)[\s-]?9?\d{4}[\s-]?\d{4})`},
+		{kind: "secret", expr: `(?i)(?:password|passwd|pwd|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key|client[_\-]?secret|auth[_\-]?token|credential)s?\b["']?\s*[=:]\s*["']?[^\s"',;]{8,}`},
 	}
 
 	rules := make([]rule, 0, len(specs))

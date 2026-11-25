@@ -62,7 +62,6 @@ const (
 type ocproxy struct {
 	url   *url.URL
 	proxy *httputil.ReverseProxy
-	key   string
 	salt  string
 	rules []rule
 	vault *vault
@@ -167,7 +166,6 @@ func new() (*ocproxy, error) {
 
 	z := &ocproxy{
 		url:   upstream,
-		key:   strings.TrimSpace(os.Getenv("OPENCODE_KEY")),
 		salt:  os.Getenv("PII_SALT"),
 		vault: &vault{items: map[string]string{}},
 		max:   integer("MAX_BODY_SIZE", 1<<26),
@@ -292,22 +290,6 @@ func bearer(header string) string {
 	}
 
 	return strings.TrimSpace(strings.TrimPrefix(header, prefix))
-}
-
-func authenticate(z *ocproxy, r *http.Request) {
-	if z.key == "" {
-		return
-	}
-
-	if bearer(r.Header.Get("Authorization")) != "" {
-		return
-	}
-
-	if strings.TrimSpace(r.Header.Get("x-api-key")) != "" {
-		return
-	}
-
-	r.Header.Set("Authorization", fmt.Sprintf("Bearer %s", z.key))
 }
 
 func key(r *http.Request) string {
@@ -652,8 +634,6 @@ func ttfb(state *state) string {
 
 func forward(z *ocproxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		authenticate(z, r)
-
 		state := &state{key: key(r), start: time.Now()}
 		r = r.WithContext(context.WithValue(r.Context(), tag{}, state))
 		defer emit(state)

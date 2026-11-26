@@ -333,7 +333,7 @@ func patterns() ([]rule, error) {
 		{kind: "card", expr: `\b\d{13,19}\b`, check: luhn},
 		{kind: "card", expr: `\b\d{4}(?:[ -]\d{4}){2,4}\b`, check: luhn},
 		{kind: "phone", expr: `(?:\+55[\s-]?(?:\d{2}[\s-]?)?9?\d{4}[\s-]?\d{4}|\(\d{2,3}\)[\s-]?9?\d{4}[\s-]?\d{4})`},
-		{kind: "secret", expr: `(?i)(?:password|passwd|pwd|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key|client[_\-]?secret|auth[_\-]?token|credential)s?\b["']?\s*[=:]\s*["']?[^\s"',;]{8,}`},
+		{kind: "cred", expr: `(?i)(?:password|passwd|pwd|senha|secret|token|api[_\-]?key|access[_\-]?token|refresh[_\-]?token|private[_\-]?key|private[_\-]?token|client[_\-]?secret|auth[_\-]?token|credencial|credential|passphrase)s?\b["']?\s*[=:]\s*["']?[^\s"',;]{8,}`},
 	}
 
 	rules := make([]rule, 0, len(specs))

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -41,6 +42,7 @@ const (
 	USAGE_MARKER   = "usage"
 	PII_MASK       = "«%s:%s»"
 	PII_BYTES      = 6
+	SECRET_BYTES   = 32
 	PII_FIELD      = "prompt_cache_key"
 	STREAM_TYPE    = "text/event-stream"
 	JSON_TYPE      = "application/json"
@@ -60,13 +62,13 @@ const (
 )
 
 type ocproxy struct {
-	url   *url.URL
-	proxy *httputil.ReverseProxy
-	salt  string
-	rules []rule
-	vault *vault
-	max   int64
-	wait  time.Duration
+	url    *url.URL
+	proxy  *httputil.ReverseProxy
+	secret []byte
+	rules  []rule
+	vault  *vault
+	max    int64
+	wait   time.Duration
 }
 
 type reader struct {
@@ -164,12 +166,19 @@ func new() (*ocproxy, error) {
 		return nil, fmt.Errorf("ZEN_URL invalida (%q): esquema ausente", raw)
 	}
 
+	secret := make([]byte, SECRET_BYTES)
+
+	_, err = rand.Read(secret)
+	if err != nil {
+		return nil, fmt.Errorf("chave PII: %w", err)
+	}
+
 	z := &ocproxy{
-		url:   upstream,
-		salt:  os.Getenv("PII_SALT"),
-		vault: &vault{items: map[string]string{}},
-		max:   integer("MAX_BODY_SIZE", 1<<26),
-		wait:  seconds("UPSTREAM_TIMEOUT", UPSTREAM_TIMEOUT),
+		url:    upstream,
+		secret: secret,
+		vault:  &vault{items: map[string]string{}},
+		max:    integer("MAX_BODY_SIZE", 1<<26),
+		wait:   seconds("UPSTREAM_TIMEOUT", UPSTREAM_TIMEOUT),
 	}
 
 	rules, err := patterns()
@@ -363,7 +372,7 @@ func redact(z *ocproxy, raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("pii: %w", err)
 	}
 
-	return encode(scrub(body, z.rules, z.salt, z.vault))
+	return encode(scrub(body, z.rules, z.secret, z.vault))
 }
 
 func encode(body any) ([]byte, error) {
@@ -379,7 +388,7 @@ func encode(body any) ([]byte, error) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte(NEWLINE)), nil
 }
 
-func scrub(value any, rules []rule, salt string, v *vault) any {
+func scrub(value any, rules []rule, secret []byte, v *vault) any {
 	switch item := value.(type) {
 	case map[string]any:
 		for name, inner := range item {
@@ -387,24 +396,24 @@ func scrub(value any, rules []rule, salt string, v *vault) any {
 				continue
 			}
 
-			item[name] = scrub(inner, rules, salt, v)
+			item[name] = scrub(inner, rules, secret, v)
 		}
 
 		return item
 	case []any:
 		for i, inner := range item {
-			item[i] = scrub(inner, rules, salt, v)
+			item[i] = scrub(inner, rules, secret, v)
 		}
 
 		return item
 	case string:
-		return shield(item, rules, salt, v)
+		return shield(item, rules, secret, v)
 	}
 
 	return value
 }
 
-func shield(text string, rules []rule, salt string, v *vault) string {
+func shield(text string, rules []rule, secret []byte, v *vault) string {
 	for _, r := range rules {
 		text = r.expr.ReplaceAllStringFunc(text, func(match string) string {
 			if r.check != nil {
@@ -413,7 +422,7 @@ func shield(text string, rules []rule, salt string, v *vault) string {
 				}
 			}
 
-			mask := stamp(r.kind, match, salt)
+			mask := stamp(r.kind, match, secret)
 			v.keep(mask, match)
 
 			return mask
@@ -423,10 +432,11 @@ func shield(text string, rules []rule, salt string, v *vault) string {
 	return text
 }
 
-func stamp(kind string, value string, salt string) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s", salt, value)))
+func stamp(kind string, value string, secret []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(fmt.Sprintf("%s:%s", kind, value)))
 
-	return fmt.Sprintf(PII_MASK, kind, hex.EncodeToString(sum[:PII_BYTES]))
+	return fmt.Sprintf(PII_MASK, kind, hex.EncodeToString(mac.Sum(nil)[:PII_BYTES]))
 }
 
 func digits(raw string) string {
